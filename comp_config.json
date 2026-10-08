@@ -1,0 +1,5 @@
+{
+  "_说明": "可选装饰件清单。components 为空 = 形象本体就是全部（鹿角已画进底图，鱼尾已下架）。以后要加挂件，往这里加一条即可，deskpet.py 的右键菜单会自动多出一个开关。",
+  "_字段": "key=唯一标识（同时作为状态存档的键）；name=菜单里显示的名字；file=sprites/final 下的 PNG；layer=behind 表示画在人物身后，front 表示身前；poses.<姿势>：h=组件目标高度(px)，tx=水平位置占底图宽比(0=最左,1=最右)，ty=垂直位置占底图高比，rot=旋转角(正=逆时针)，flip=左右翻转，mirror_with_pose=人物转身时组件是否一起镜像",
+  "components": []
+}

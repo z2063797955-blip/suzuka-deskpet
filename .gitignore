@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+pet.log
+pet_state.json
+expr_trigger.json
+sprites/_tune*.jpg
