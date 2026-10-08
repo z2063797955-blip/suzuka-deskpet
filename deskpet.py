@@ -24,6 +24,7 @@ import time
 import math
 import random
 import glob
+import shutil
 import ctypes
 from ctypes import wintypes
 
@@ -63,6 +64,7 @@ WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 WM_MOUSEMOVE = 0x0200
 WM_RBUTTONUP = 0x0205
+WM_LBUTTONDBLCLK = 0x0203
 WM_MOUSEWHEEL = 0x020A
 SWP_NOMOVE = 0x0002
 
@@ -250,9 +252,11 @@ class Pet:
     CMD_PET, CMD_FEED, CMD_TALK, CMD_MEM = 1, 2, 3, 4
     CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_ZOOM_RESET = 5, 6, 7
     CMD_BUBBLE, CMD_QUIT = 8, 9
+    CMD_AUTOSTART = 10
     CMD_DECOR_BASE = 100          # 装饰开关的编号从这里开始往后排
     CMD_EXPR_BASE = 200           # 表情的编号从这里开始往后排
     ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.3, 2.5, 0.125
+    SLEEP_AFTER = 300             # 多久没人搭理就打瞌睡（秒）
     # 贴边：每个边用哪张图、要不要镜像、气泡放哪边（上边框动作已按需求撤销）
     PEEK_SIDE = {
         "left":   ("peek_left", False),
@@ -277,6 +281,10 @@ class Pet:
         self.state_flags = load_state()
         self.zoom = float(self.state_flags.get("zoom", 1.0))
         self.peek = None            # None / left / right / bottom：贴边收起状态
+        self.sleeping = False       # 久无人理 → 打瞌睡（sleepy 差分贴在坐姿上）
+        self.expr_pose = "idle"     # 表情贴在哪张姿势上
+        self.last_touch = time.time()
+        self._peek_return = None    # 做表情临时出边后，要躲回的那条边
 
         self._apply_scale(reload=False)
         self.lines = load_lines()
@@ -284,8 +292,8 @@ class Pet:
         self.frame_cache = {}
         self.screen_w = user32.GetSystemMetrics(0)
         self.screen_h = user32.GetSystemMetrics(1)
-        self.x = self.screen_w - self.cw - 60
-        self.y = self.screen_h - self.ch - 70
+        # 上次关在哪儿，这次就放回哪儿（没记录或位置已失效 → 默认右下角）
+        self.x, self.y = self._restore_pos()
 
         self.pose = "idle"
         self.flip = False
@@ -405,6 +413,7 @@ class Pet:
             self._clamp()
             user32.SetWindowPos(self.hwnd, -1, int(self.x), int(self.y),
                                 int(self.cw), int(self.ch), SWP_NOACTIVATE)
+        self._touch()
         self.say(f"大小 {int(self.zoom * 100)}%", 1.2)
 
     # ------------------------------------------------------------ 窗口
@@ -428,6 +437,7 @@ class Pet:
     def _wndproc(self, hwnd, msg, wparam, lparam):
         try:
             if msg == WM_LBUTTONDOWN:
+                self._peek_return = None      # 用户自己动手了，就别自作主张躲回去
                 if self.peek:
                     self._unpeek()
                 self.dragging = True
@@ -435,6 +445,16 @@ class Pet:
                 pt = self._cursor()
                 self.drag_dx, self.drag_dy = pt[0] - self.x, pt[1] - self.y
                 user32.SetCapture(hwnd)
+                return 0
+            if msg == WM_LBUTTONDBLCLK:
+                # 双击 = 摸头摸到高兴（单击那下已经打过招呼了）
+                self.dragging = False
+                user32.ReleaseCapture()
+                self._touch()
+                e = next((x for x in self.expr_defs if x["key"] == "happy"), None)
+                if e:
+                    self.play_expression(e, line=random.choice(
+                        ["……又戳。", "摸头要收费的。", "行了，去忙你的吧。"]), secs=2.5)
                 return 0
             if msg == WM_MOUSEMOVE and self.dragging:
                 pt = self._cursor()
@@ -451,12 +471,15 @@ class Pet:
                     self.dragging = False
                     user32.ReleaseCapture()
                     if not self.moved:
+                        self._touch()
                         self.say(self.pick("pet"), 3.0)
                         self.set_pose("idle", 2.0)
                     else:
+                        self._save_pos()
                         self._maybe_peek()
                 return 0
             if msg == WM_RBUTTONUP:
+                self._touch()
                 self.show_menu(hwnd)
                 return 0
             if msg == WM_MOUSEWHEEL:
@@ -480,6 +503,71 @@ class Pet:
     def _clamp(self):
         self.x = max(-40, min(self.x, self.screen_w - self.cw + 40))
         self.y = max(-20, min(self.y, self.screen_h - self.ch + 40))
+
+    # ------------------------------------------------------------ 位置记忆 / 互动
+    def _restore_pos(self):
+        """上次待的位置；没有记录、或者那块屏幕已经不在了，就回默认右下角。"""
+        dx = self.screen_w - self.cw - 60
+        dy = self.screen_h - self.ch - 70
+        try:
+            sx, sy = self.state_flags.get("x"), self.state_flags.get("y")
+            if sx is not None and sy is not None:
+                sx, sy = int(sx), int(sy)
+                if -self.cw + 40 < sx < self.screen_w - 40 and -20 < sy < self.screen_h - 40:
+                    return sx, sy
+        except Exception:
+            pass
+        return dx, dy
+
+    def _save_pos(self):
+        """记住位置（贴边的时候不记——那是临时姿势，不是她的家）。"""
+        if self.peek or self.dragging:
+            return
+        self.state_flags["x"] = int(self.x)
+        self.state_flags["y"] = int(self.y)
+        save_state(self.state_flags)
+
+    def _touch(self):
+        """任何互动都算"搭理了她"：记时间，顺手叫醒。"""
+        self.last_touch = time.time()
+        if self.sleeping:
+            self.sleeping = False
+            self.expr = None
+            self.expr_pose = "idle"
+            self.say(random.choice(["……嗯？", "醒了醒了。", "谁叫我。"]), 2.0)
+
+    # ------------------------------------------------------------ 开机自启
+    def _startup_dir(self):
+        return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
+                            "Start Menu", "Programs", "Startup")
+
+    def _autostart_link(self):
+        return os.path.join(self._startup_dir(), "桌面宠物.lnk")
+
+    def _autostart_on(self):
+        return os.path.exists(self._autostart_link())
+
+    def _toggle_autostart(self):
+        """开/关开机自启：往启动文件夹里放（或删）一个快捷方式。"""
+        link = self._autostart_link()
+        try:
+            if os.path.exists(link):
+                os.remove(link)
+                return False
+            desk = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop", "桌面宠物.lnk")
+            if os.path.exists(desk):
+                shutil.copyfile(desk, link)      # 桌面那个快捷方式连图标一起搬
+            else:
+                import win32com.client
+                ws = win32com.client.Dispatch("WScript.Shell")
+                sc = ws.CreateShortcut(link)
+                sc.TargetPath = os.path.join(HERE, "启动桌宠.bat")
+                sc.WorkingDirectory = HERE
+                sc.IconLocation = os.path.join(HERE, "deskpet.ico") + ",0"
+                sc.Save()
+            return True
+        except Exception:
+            return self._autostart_on()
 
     def show_menu(self, hwnd):
         menu = user32.CreatePopupMenu()
@@ -511,6 +599,7 @@ class Pet:
             (self.CMD_BUBBLE, "气泡位置：" + {
                 "auto": "自动", "top": "头顶", "bottom": "脚下"}.get(
                     self.state_flags.get("bubble_pos", "auto"), "自动"), False),
+            (self.CMD_AUTOSTART, "开机自动启动", self._autostart_on()),
             (0, None, False),
             (self.CMD_QUIT, "退下吧", False),
         ]
@@ -532,6 +621,8 @@ class Pet:
         self.do_cmd(cmd)
 
     def do_cmd(self, cmd):
+        if cmd:
+            self._touch()          # 点菜单也算搭理她（打瞌睡时会被叫醒）
         if cmd == self.CMD_PET:
             self.say(self.pick("pet"), 3.0)
         elif cmd == self.CMD_FEED:
@@ -571,7 +662,11 @@ class Pet:
                 save_state(self.state_flags)
                 name = comps[i].get("name", k)
                 self.say(f"{name}{'戴好了' if self.state_flags[k] else '收起来了'}。", 3.0)
+        elif cmd == self.CMD_AUTOSTART:
+            on = self._toggle_autostart()
+            self.say("记下了，开机我自己过来。" if on else "好，开机不打扰你。", 3.0)
         elif cmd == self.CMD_QUIT:
+            self._save_pos()
             self.running = False
 
     # ------------------------------------------------------------ 贴边收起
@@ -588,18 +683,39 @@ class Pet:
             side = "right"
         if side is None:
             return
+        self._peek_to(side)
+
+    def _peek_to(self, side, line=None):
+        """贴到指定边去（拖过去判定到的边，或者做完表情自己躲回去）。"""
         self.peek = side
         self.pose = self.PEEK_SIDE[side][0]
         self.expr = None
+        self.expr_pose = "idle"
+        self.sleeping = False
+        self.last_touch = time.time()
         self._apply_scale(reload=True)     # 换成紧贴窗口（头顶留白也要收掉）
         self._snap_peek()
         self.pose_until = time.time() + 1e9
-        self.say(random.choice(["边上风大。", "……找到我了？", "这样看着你。",
-                                "暂时躲一会儿。", "就露个头。"]), 4.0)
+        self.say(line or random.choice(["边上风大。", "……找到我了？", "这样看着你。",
+                                        "暂时躲一会儿。", "就露个头。"]), 4.0)
 
-    def _unpeek(self):
+    def _unpeek(self, step_out=False):
+        """离开贴边状态。step_out=True 时顺便往屏幕里挪一点——用来做表情，
+        不然她半个身子还在屏幕外，脸看不清。"""
+        side = self.peek
         self.peek = None
         self._relayout_window(reload=True)
+        if step_out and side:
+            margin = 18
+            if side == "left":
+                self.x = margin
+            elif side == "right":
+                self.x = self.screen_w - self.cw - margin
+            elif side == "bottom":
+                self.y = self.screen_h - self.ch - margin
+            self._clamp()
+            user32.SetWindowPos(self.hwnd, -1, int(self.x), int(self.y),
+                                int(self.cw), int(self.ch), SWP_NOACTIVATE)
         self.set_pose("idle", 3.0)
 
     # ------------------------------------------------------------ 表情
@@ -625,11 +741,13 @@ class Pet:
             e = self.resolve_expr(e)
         if not e:
             return
+        self._touch()
+        self.expr_pose = "idle"
         if self.peek:
-            # 贴边躲着的时候只说话不换脸（peek 图的脸位置不一样）
-            self.bubble = line or random.choice(e.get("say") or ["……"])
-            self.bubble_until = time.time() + 3.5
-            return
+            # 贴边躲着时做表情：peek 图的脸是另一种画法，没法直接贴差分，
+            # 所以先从边上缩回来露个脸，做完了自己躲回原来那条边。
+            self._peek_return = self.peek
+            self._unpeek(step_out=True)
         if e["key"] not in self.assets.get("expr", {}):
             return
         self.expr = e["key"]
@@ -682,9 +800,22 @@ class Pet:
         self.poll_trigger()
         if self.expr and now > self.expr_until:
             self.expr = None
+            self.sleeping = False
+        # 表情做完了，自己躲回刚才那条边（用户自己动手就先取消，别把人拖回去）
+        if (self._peek_return and not self.peek and not self.expr_active()
+                and not self.dragging):
+            side = self._peek_return
+            self._peek_return = None
+            self._peek_to(side, line=random.choice(["……说完了，我回去了。",
+                                                    "没事，继续躲着。"]))
         if self.peek:
             self.pose = self.PEEK_SIDE[self.peek][0]
             self.pose_until = now + 3600.0
+        elif self.sleeping:
+            self.pose = self.expr_pose          # 坐着打盹，别站起来
+            self.pose_until = now + 3600.0
+            if random.random() < 0.02:
+                self.say(random.choice(["……呼。", "zZZ", "别吵……"]), 3.0)
         elif self.expr_active():
             # 做表情的时候站定，别边做鬼脸边溜达
             self.pose = "idle"
@@ -696,7 +827,19 @@ class Pet:
             else:
                 self.set_pose("idle", random.uniform(8, 20))
 
-        if now > self.next_talk:
+        # 久无人理 → 打个瞌睡（sleepy 差分贴在坐姿上，看着是真睡过去了）
+        if (not self.peek and not self.sleeping and not self.dragging
+                and not self.bubble and not self.expr_active()
+                and now - self.last_touch > self.SLEEP_AFTER):
+            self.sleeping = True
+            self.expr_pose = "sit"
+            self.expr = "sleepy" if "sleepy" in self.assets.get("expr", {}) else None
+            self.expr_until = now + 1e9
+            self.pose = "sit"
+            self.pose_until = now + 1e9
+            self.say(random.choice(["……呼。", "就眯一会儿。", "谁在叫我……"]), 3.0)
+
+        if now > self.next_talk and not self.sleeping:
             self.next_talk = now + random.uniform(120, 300)
             if random.random() < 0.5:
                 if self.mem_lines and random.random() < 0.4:
@@ -710,9 +853,10 @@ class Pet:
     # ------------------------------------------------------------ 渲染
     def frame(self):
         if self.expr_active() and not self.peek:
-            key = ("expr", self.expr)
+            key = ("expr", self.expr, self.expr_pose)
             if key not in self.frame_cache:
-                im = compose.expression_frame(self.assets, self.expr)
+                im = compose.expression_frame(self.assets, self.expr,
+                                              pose=self.expr_pose)
                 if len(self.frame_cache) > 24:
                     self.frame_cache.clear()
                 self.frame_cache[key] = im
@@ -839,7 +983,10 @@ class Pet:
             self.bob_t += dt
             self.think(dt)
             self.render()
-            time.sleep(1 / 30.0)
+            # 静止时降帧：分层窗口每帧都是整幅重绘，闲着不必跑满 30fps
+            busy = bool(self.bubble) or self.expr_active() or self.dragging
+            time.sleep(1 / (30.0 if busy else 15.0))
+        self._save_pos()
 
 
 if __name__ == "__main__":
